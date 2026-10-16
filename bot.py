@@ -13,10 +13,15 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
 GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW.isdigit() else 0
-TARGET_URL = os.getenv(
-    "TARGET_URL",
-    "https://ultimateuidbypass.site/api/uid-system/trials/uid_trial_17de005fd3/claim",
-)
+
+# ===== RESELLER PANEL (API swap) =====
+PANEL_BASE = os.getenv("PANEL_BASE", "http://82.41.64.36:2007").rstrip("/")
+PANEL_USER = os.getenv("PANEL_USER", "BENX")
+PANEL_PASS = os.getenv("PANEL_PASS", "1234")
+PANEL_ADD_ACTION = "add_uid"
+DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "2"))
+# =====================================
+
 WATCH_CHANNEL_ID_RAW = os.getenv("WATCH_CHANNEL_ID", "").strip()
 WATCH_CHANNEL_ID = int(WATCH_CHANNEL_ID_RAW) if WATCH_CHANNEL_ID_RAW.isdigit() else 0
 TICKET_CHANNEL_ID_RAW = os.getenv("TICKET_CHANNEL_ID", "").strip()
@@ -42,6 +47,7 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 _claims_lock = asyncio.Lock()
+_panel_session: aiohttp.ClientSession | None = None
 
 
 def _load_json(path: str, default: dict) -> dict:
@@ -145,35 +151,78 @@ def build_limit_embed(author: discord.abc.User, used: int, limit: int) -> discor
     return e
 
 
+# ===== PANEL HTTP (API swap only) =====
+
+async def _get_panel_session() -> aiohttp.ClientSession:
+    global _panel_session
+    if _panel_session is None or _panel_session.closed:
+        _panel_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+        )
+    return _panel_session
+
+
 async def submit_uid(uid: str) -> dict:
+    """Same return shape as before. Internals now go to the reseller panel."""
+    session = await _get_panel_session()
+
     headers = {
-        "Content-Type": "application/json",
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
         ),
-        "Origin": "https://ultimateuidbypass.site",
-        "Referer": "https://ultimateuidbypass.site/",
-        "Accept": "application/json, text/plain, */*",
+        "Referer": f"{PANEL_BASE}/reseller",
     }
+
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                TARGET_URL,
-                json={"uid": uid},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            ) as r:
-                text = await r.text()
-                try:
-                    data = await r.json()
-                except Exception:
-                    data = None
-                return {"status": r.status, "text": text, "data": data}
+        # 1) login — cookie session নেয়
+        async with session.post(
+            f"{PANEL_BASE}/login",
+            data={"username": PANEL_USER, "password": PANEL_PASS},
+            headers=headers,
+            allow_redirects=True,
+        ) as lr:
+            print(f"[panel] login {lr.status}")
+
+        # 2) UID add — DEFAULT_DAYS দিনের জন্য
+        async with session.post(
+            f"{PANEL_BASE}/reseller",
+            data={
+                "action": PANEL_ADD_ACTION,
+                "uid": uid,
+                "days": str(DEFAULT_DAYS),
+                "custom_name": "",
+            },
+            headers=headers,
+            allow_redirects=True,
+        ) as r:
+            text = await r.text()
+            ok = r.status < 400
+
+            if ok:
+                data = {
+                    "success": True,
+                    "claim": {
+                        "days": DEFAULT_DAYS,
+                        "expiresAt": "",
+                    },
+                    "apiResult": {
+                        "message": f"Account ID '{uid}' added successfully."
+                    },
+                    "message": f"Account ID '{uid}' added successfully.",
+                    "alreadyClaimed": False,
+                }
+            else:
+                data = None
+
+            return {"status": r.status, "text": text, "data": data}
+
     except asyncio.TimeoutError:
         return {"status": 0, "text": "timeout", "data": None}
     except Exception as e:
         return {"status": 0, "text": f"{type(e).__name__}: {e}", "data": None}
+
+# ===== END PANEL HTTP =====
 
 
 def build_success(uid: str, data: dict, author: discord.abc.User,
@@ -482,7 +531,7 @@ async def on_ready():
     print(f"[ready] guild: {GUILD_ID or 'GLOBAL'}")
     print(f"[ready] watch: {WATCH_CHANNEL_ID or 'ANY'}")
     print(f"[ready] ticket: {TICKET_CHANNEL_ID or 'unset'}")
-    print(f"[ready] target: {TARGET_URL}")
+    print(f"[ready] panel: {PANEL_BASE} user={PANEL_USER} days={DEFAULT_DAYS}")
     print(f"[ready] claims: {len(load_claims())} | limits: {len(load_limits())}")
 
     try:
