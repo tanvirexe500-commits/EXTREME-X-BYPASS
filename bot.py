@@ -1,11 +1,5 @@
-"""
-UID Relay Bot
-- Discord slash commands: /add_uid, /ping, /sync
-- /add_uid relays UID to ultimateuidbypass.site trial claim endpoint
-- Single-process: Discord client + aiohttp keepalive server for Render
-"""
-
 import os
+import re
 import asyncio
 import aiohttp
 import discord
@@ -22,29 +16,162 @@ TARGET_URL = os.getenv(
     "TARGET_URL",
     "https://ultimateuidbypass.site/api/uid-system/trials/uid_trial_17de005fd3/claim",
 )
+WATCH_CHANNEL_ID_RAW = os.getenv("WATCH_CHANNEL_ID", "").strip()
+WATCH_CHANNEL_ID = int(WATCH_CHANNEL_ID_RAW) if WATCH_CHANNEL_ID_RAW.isdigit() else 0
 PORT = int(os.getenv("PORT", "10000"))
 REQUEST_TIMEOUT = 20
+UID_RE = re.compile(r"^\d{8,12}$")
 
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN missing in environment")
 
 intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+intents.messages = True
+
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
-# ---------- /add_uid ----------
+async def submit_uid(uid: str) -> dict:
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Origin": "https://ultimateuidbypass.site",
+        "Referer": "https://ultimateuidbypass.site/",
+        "Accept": "application/json, text/plain, */*",
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                TARGET_URL,
+                json={"uid": uid},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as r:
+                text = await r.text()
+                try:
+                    data = await r.json()
+                except Exception:
+                    data = None
+                return {"status": r.status, "text": text, "data": data}
+    except asyncio.TimeoutError:
+        return {"status": 0, "text": "timeout", "data": None}
+    except Exception as e:
+        return {"status": 0, "text": f"{type(e).__name__}: {e}", "data": None}
 
-@tree.command(name="add_uid", description="Add a UID to the bypass portal")
-@app_commands.describe(uid="Numeric game UID (digits only)")
+
+def build_success(uid: str, data: dict, author: discord.abc.User) -> discord.Embed:
+    claim = data.get("claim") or {}
+    days = claim.get("days", "?")
+    expires = claim.get("expiresAt", "")
+    already = bool(data.get("alreadyClaimed"))
+    server_msg = (
+        data.get("message")
+        or (data.get("apiResult") or {}).get("message")
+        or f"Account ID '{uid}' added successfully."
+    )
+
+    embed = discord.Embed(
+        title="\u2705 UID Added Successfully",
+        color=discord.Color.from_rgb(220, 38, 38),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="\U0001F194 Target UID", value=f"`{uid}`", inline=True)
+    embed.add_field(name="\u23F3 Active Days", value=f"**{days}** Day(s)", inline=True)
+    embed.add_field(
+        name="\U0001F4CB Server Message",
+        value=f"```{server_msg}```",
+        inline=False,
+    )
+    if expires:
+        embed.add_field(name="\u23F0 Expires", value=f"`{expires}`", inline=False)
+    if already:
+        embed.add_field(
+            name="\u26A0\uFE0F Note",
+            value="This IP already claimed this portal.",
+            inline=False,
+        )
+    embed.set_footer(
+        text=f"Executed by {author.display_name}",
+        icon_url=author.display_avatar.url,
+    )
+    return embed
+
+
+def build_failure(uid: str, status: int, snippet: str, author: discord.abc.User) -> discord.Embed:
+    embed = discord.Embed(
+        title="\u274c UID Add Failed",
+        description=f"HTTP `{status}`" if status else "Network error",
+        color=discord.Color.from_rgb(190, 18, 60),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Target UID", value=f"`{uid}`", inline=True)
+    embed.add_field(
+        name="Server Message",
+        value=f"```{(snippet or 'no response body')[:300]}```",
+        inline=False,
+    )
+    embed.set_footer(
+        text=f"Executed by {author.display_name}",
+        icon_url=author.display_avatar.url,
+    )
+    return embed
+
+
+@client.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if not message.guild:
+        return
+    if GUILD_ID and message.guild.id != GUILD_ID:
+        return
+    if WATCH_CHANNEL_ID and message.channel.id != WATCH_CHANNEL_ID:
+        return
+
+    content = message.content.strip()
+    if not UID_RE.match(content):
+        return
+
+    uid = content
+    result = await submit_uid(uid)
+    data = result.get("data")
+    status = result.get("status", 0)
+
+    if status == 200 and isinstance(data, dict) and data.get("success"):
+        embed = build_success(uid, data, message.author)
+        try:
+            await message.reply(embed=embed, mention_author=False)
+        except discord.Forbidden:
+            pass
+    elif status == 200 and isinstance(data, dict) and data.get("alreadyClaimed"):
+        embed = build_success(uid, data, message.author)
+        try:
+            await message.reply(embed=embed, mention_author=False)
+        except discord.Forbidden:
+            pass
+    else:
+        embed = build_failure(uid, status, result.get("text", ""), message.author)
+        try:
+            await message.reply(embed=embed, mention_author=False)
+        except discord.Forbidden:
+            pass
+
+
+@tree.command(name="add", description="Add a UID to the bypass portal")
+@app_commands.describe(uid="Numeric game UID (8-12 digits)")
 async def add_uid(interaction: discord.Interaction, uid: str):
     uid = uid.strip()
 
-    # invalid input → red embed
-    if not uid.isdigit():
+    if not UID_RE.match(uid):
         bad = discord.Embed(
             title="\u274c Invalid UID",
-            description="UID must contain digits only.",
+            description="UID must be 8 to 12 digits, numeric only.",
             color=discord.Color.from_rgb(220, 38, 38),
             timestamp=discord.utils.utcnow(),
         )
@@ -57,132 +184,17 @@ async def add_uid(interaction: discord.Interaction, uid: str):
 
     await interaction.response.defer(ephemeral=False, thinking=True)
 
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        ),
-        "Origin": "https://ultimateuidbypass.site",
-        "Referer": "https://ultimateuidbypass.site/",
-        "Accept": "application/json, text/plain, */*",
-    }
+    result = await submit_uid(uid)
+    data = result.get("data")
+    status = result.get("status", 0)
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                TARGET_URL,
-                json={"uid": uid},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            ) as r:
-                text = await r.text()
-                try:
-                    data = await r.json()
-                except Exception:
-                    data = None
+    if status == 200 and isinstance(data, dict) and data.get("success"):
+        embed = build_success(uid, data, interaction.user)
+        await interaction.followup.send(embed=embed, ephemeral=False)
+    else:
+        embed = build_failure(uid, status, result.get("text", ""), interaction.user)
+        await interaction.followup.send(embed=embed, ephemeral=False)
 
-                if r.status == 200 and isinstance(data, dict) and data.get("success"):
-                    claim = data.get("claim") or {}
-                    days = claim.get("days", "?")
-                    expires = claim.get("expiresAt", "")
-                    already = bool(data.get("alreadyClaimed"))
-                    server_msg = (
-                        data.get("message")
-                        or (data.get("apiResult") or {}).get("message")
-                        or f"Account ID '{uid}' added successfully."
-                    )
-
-                    embed = discord.Embed(
-                        title="\u2705 UID Added Successfully",
-                        color=discord.Color.from_rgb(220, 38, 38),
-                        timestamp=discord.utils.utcnow(),
-                    )
-                    embed.add_field(
-                        name="\U0001F194 Target UID",
-                        value=f"`{uid}`",
-                        inline=True,
-                    )
-                    embed.add_field(
-                        name="\u23F3 Active Days",
-                        value=f"**{days}** Day(s)",
-                        inline=True,
-                    )
-                    access_text = "**\U0001F451 Admin Access (Unlimited)**"
-                    if already:
-                        access_text = "**\U0001F512 IP Lock \u2014 Already Claimed**"
-                    embed.add_field(
-                        name="\U0001F4B3 Credit Status",
-                        value=access_text,
-                        inline=False,
-                    )
-                    embed.add_field(
-                        name="\U0001F4CB Server Message",
-                        value=f"```{server_msg}```",
-                        inline=False,
-                    )
-                    if expires:
-                        embed.add_field(
-                            name="\u23F0 Expires",
-                            value=f"`{expires}`",
-                            inline=False,
-                        )
-                    embed.set_footer(
-                        text=f"Executed by {interaction.user.display_name}",
-                        icon_url=interaction.user.display_avatar.url,
-                    )
-
-                    await interaction.followup.send(embed=embed, ephemeral=False)
-                    return
-
-                # failure embed
-                snippet = (text or "")[:300]
-                fail = discord.Embed(
-                    title="\u274c UID Add Failed",
-                    description=f"HTTP `{r.status}`",
-                    color=discord.Color.from_rgb(190, 18, 60),
-                    timestamp=discord.utils.utcnow(),
-                )
-                fail.add_field(name="Target UID", value=f"`{uid}`", inline=True)
-                fail.add_field(
-                    name="Server Message",
-                    value=f"```{snippet or 'no response body'}```",
-                    inline=False,
-                )
-                fail.set_footer(
-                    text=f"Executed by {interaction.user.display_name}",
-                    icon_url=interaction.user.display_avatar.url,
-                )
-                await interaction.followup.send(embed=fail, ephemeral=False)
-
-    except asyncio.TimeoutError:
-        t = discord.Embed(
-            title="\u274c Request Timed Out",
-            description="The bypass server took too long to respond.",
-            color=discord.Color.from_rgb(190, 18, 60),
-            timestamp=discord.utils.utcnow(),
-        )
-        t.set_footer(
-            text=f"Executed by {interaction.user.display_name}",
-            icon_url=interaction.user.display_avatar.url,
-        )
-        await interaction.followup.send(embed=t, ephemeral=False)
-
-    except Exception as e:
-        t = discord.Embed(
-            title="\u274c Request Error",
-            description=f"```{e}```",
-            color=discord.Color.from_rgb(190, 18, 60),
-            timestamp=discord.utils.utcnow(),
-        )
-        t.set_footer(
-            text=f"Executed by {interaction.user.display_name}",
-            icon_url=interaction.user.display_avatar.url,
-        )
-        await interaction.followup.send(embed=t, ephemeral=False)
-
-
-# ---------- /ping ----------
 
 @tree.command(name="ping", description="Check if the bot is online")
 async def ping(interaction: discord.Interaction):
@@ -190,12 +202,11 @@ async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"pong — gateway `{latency}ms`\n"
         f"guild scoped: `{GUILD_ID or 'global'}`\n"
+        f"watch channel: `{WATCH_CHANNEL_ID or 'any'}`\n"
         f"commands loaded: `{[c.name for c in tree.get_commands()]}`",
         ephemeral=True,
     )
 
-
-# ---------- /sync (owner only) ----------
 
 @tree.command(name="sync", description="Re-sync slash commands (owner only)")
 async def sync_cmd(interaction: discord.Interaction):
@@ -218,12 +229,11 @@ async def sync_cmd(interaction: discord.Interaction):
         await interaction.followup.send(f"sync failed: `{e}`", ephemeral=True)
 
 
-# ---------- ready ----------
-
 @client.event
 async def on_ready():
     print(f"[ready] {client.user} (id={client.user.id})")
     print(f"[ready] guild target: {GUILD_ID or 'GLOBAL'}")
+    print(f"[ready] watch channel: {WATCH_CHANNEL_ID or 'ANY'}")
     print(f"[ready] target url: {TARGET_URL}")
 
     try:
@@ -244,8 +254,6 @@ async def on_ready():
     except Exception as e:
         print(f"[sync] failed: {type(e).__name__}: {e}")
 
-
-# ---------- keepalive HTTP for Render ----------
 
 async def _health(_request):
     return web.Response(text="ok")
