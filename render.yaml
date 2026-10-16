@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: uid-relay-bot
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GUILD_ID
+        sync: false
+      - key: TARGET_URL
+        value: https://ultimateuidbypass.site/api/uid-system/trials/uid_trial_17de005fd3/claim
+      - key: PYTHON_VERSION
+        value: 3.11.9
