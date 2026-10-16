@@ -13,16 +13,10 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
 GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW.isdigit() else 0
-
-# ===== RESELLER PANEL (ULTIMATE PROXY) =====
-PANEL_BASE = os.getenv("PANEL_BASE", "http://82.41.64.36:2007").rstrip("/")
-PANEL_USER = os.getenv("PANEL_USER", "BENX")
-PANEL_PASS = os.getenv("PANEL_PASS", "")
-PANEL_ADD_PATH = "/reseller"
-PANEL_ACTION_ADD = "add_uid"
-DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "2"))
-# ===========================================
-
+TARGET_URL = os.getenv(
+    "TARGET_URL",
+    "https://ultimateuidbypass.site/api/uid-system/trials/uid_trial_17de005fd3/claim",
+)
 WATCH_CHANNEL_ID_RAW = os.getenv("WATCH_CHANNEL_ID", "").strip()
 WATCH_CHANNEL_ID = int(WATCH_CHANNEL_ID_RAW) if WATCH_CHANNEL_ID_RAW.isdigit() else 0
 TICKET_CHANNEL_ID_RAW = os.getenv("TICKET_CHANNEL_ID", "").strip()
@@ -38,8 +32,6 @@ LIMITS_DB = "limits.json"
 
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN missing in environment")
-if not PANEL_PASS:
-    raise SystemExit("PANEL_PASS missing in environment")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -50,7 +42,6 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 _claims_lock = asyncio.Lock()
-_panel_session: aiohttp.ClientSession | None = None
 
 
 def _load_json(path: str, default: dict) -> dict:
@@ -130,99 +121,6 @@ def ticket_link() -> str:
     return ""
 
 
-# ===== PANEL HELPERS =====
-
-async def _get_session() -> aiohttp.ClientSession:
-    global _panel_session
-    if _panel_session is None or _panel_session.closed:
-        _panel_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-                ),
-            },
-        )
-    return _panel_session
-
-
-async def panel_login() -> bool:
-    s = await _get_session()
-    try:
-        async with s.post(
-            f"{PANEL_BASE}/login",
-            data={"username": PANEL_USER, "password": PANEL_PASS},
-            allow_redirects=True,
-        ) as r:
-            ok = r.status < 400
-            print(f"[panel] login {r.status}")
-            return ok
-    except Exception as e:
-        print(f"[panel] login error: {type(e).__name__}: {e}")
-        return False
-
-
-async def panel_add_uid(uid: str, days: int = DEFAULT_DAYS) -> dict:
-    """UID add করে reseller panel-এ, default 2 দিন।"""
-    s = await _get_session()
-    await panel_login()
-
-    form = {
-        "action": PANEL_ACTION_ADD,
-        "uid": uid,
-        "days": str(days),
-        "custom_name": "",
-    }
-    headers = {"Referer": f"{PANEL_BASE}/reseller"}
-
-    try:
-        async with s.post(
-            f"{PANEL_BASE}{PANEL_ADD_PATH}",
-            data=form,
-            headers=headers,
-            allow_redirects=True,
-        ) as r:
-            body = await r.text()
-            ok = r.status < 400
-            print(f"[panel] add_uid {uid} days={days} -> {r.status}")
-            return {
-                "ok": ok,
-                "status": r.status,
-                "text": body[:500],
-                "days": days,
-            }
-    except asyncio.TimeoutError:
-        return {"ok": False, "status": 0, "text": "timeout", "days": days}
-    except Exception as e:
-        return {"ok": False, "status": 0,
-                "text": f"{type(e).__name__}: {e}", "days": days}
-
-
-async def submit_uid(uid: str) -> dict:
-    """পুরনো API কল করার জায়গায় এখন panel-এ যাবে।"""
-    res = await panel_add_uid(uid, days=DEFAULT_DAYS)
-    # bot-এর বাকি code যেই shape আশা করে, সেটায় রূপান্তর
-    return {
-        "status": 200 if res["ok"] else (res["status"] or 0),
-        "text": res["text"],
-        "data": {
-            "success": res["ok"],
-            "claim": {
-                "days": res["days"],
-                "expiresAt": "",
-            },
-            "message": (
-                f"UID {uid} added for {res['days']} days."
-                if res["ok"] else res["text"][:200]
-            ),
-            "alreadyClaimed": False,
-        } if res["ok"] else None,
-    }
-
-# ===== END PANEL HELPERS =====
-
-
 def build_limit_embed(author: discord.abc.User, used: int, limit: int) -> discord.Embed:
     e = discord.Embed(
         title="\u26D4 User Limit Reached",
@@ -247,13 +145,48 @@ def build_limit_embed(author: discord.abc.User, used: int, limit: int) -> discor
     return e
 
 
+async def submit_uid(uid: str) -> dict:
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Origin": "https://ultimateuidbypass.site",
+        "Referer": "https://ultimateuidbypass.site/",
+        "Accept": "application/json, text/plain, */*",
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                TARGET_URL,
+                json={"uid": uid},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as r:
+                text = await r.text()
+                try:
+                    data = await r.json()
+                except Exception:
+                    data = None
+                return {"status": r.status, "text": text, "data": data}
+    except asyncio.TimeoutError:
+        return {"status": 0, "text": "timeout", "data": None}
+    except Exception as e:
+        return {"status": 0, "text": f"{type(e).__name__}: {e}", "data": None}
+
+
 def build_success(uid: str, data: dict, author: discord.abc.User,
                   used: int, limit: int) -> discord.Embed:
     claim = data.get("claim") or {}
     days = claim.get("days", "?")
     expires = claim.get("expiresAt", "")
     already = bool(data.get("alreadyClaimed"))
-    server_msg = data.get("message") or f"Account ID '{uid}' added successfully."
+    server_msg = (
+        data.get("message")
+        or (data.get("apiResult") or {}).get("message")
+        or f"Account ID '{uid}' added successfully."
+    )
 
     embed = discord.Embed(
         title="\u2705 UID Added Successfully",
@@ -269,7 +202,7 @@ def build_success(uid: str, data: dict, author: discord.abc.User,
     )
     embed.add_field(
         name="\U0001F4CB Server Message",
-        value=f"```{server_msg[:400]}```",
+        value=f"```{server_msg}```",
         inline=False,
     )
     if expires:
@@ -399,7 +332,9 @@ async def add_uid(interaction: discord.Interaction, uid: str):
 async def whitelist_cmd(interaction: discord.Interaction,
                         user: discord.Member, limit: int):
     if interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("Owner only.", ephemeral=True)
+        await interaction.response.send_message(
+            "Owner only.", ephemeral=True
+        )
         return
 
     if limit < 0 or limit > 1000:
@@ -493,7 +428,11 @@ async def claims_cmd(interaction: discord.Interaction, user: discord.Member = No
         lines = []
         for c in claims:
             lines.append(f"`{c.get('uid','?')}` — {c.get('claimedAt','?')[:19]}")
-        embed.add_field(name="UIDs", value="\n".join(lines)[:1000], inline=False)
+        embed.add_field(
+            name="UIDs",
+            value="\n".join(lines)[:1000],
+            inline=False,
+        )
     embed.set_footer(
         text=f"Executed by {interaction.user.display_name}",
         icon_url=interaction.user.display_avatar.url,
@@ -509,9 +448,8 @@ async def ping(interaction: discord.Interaction):
         f"guild: `{GUILD_ID or 'global'}`\n"
         f"watch: `{WATCH_CHANNEL_ID or 'any'}`\n"
         f"ticket: `{TICKET_CHANNEL_ID or 'unset'}`\n"
-        f"panel: `{PANEL_BASE}` user=`{PANEL_USER}`\n"
-        f"days: `{DEFAULT_DAYS}`\n"
-        f"claims: `{len(load_claims())}` | limits: `{len(load_limits())}`",
+        f"claims: `{len(load_claims())}` | limits: `{len(load_limits())}`\n"
+        f"commands: `{[c.name for c in tree.get_commands()]}`",
         ephemeral=True,
     )
 
@@ -540,14 +478,12 @@ async def sync_cmd(interaction: discord.Interaction):
 @client.event
 async def on_ready():
     print(f"[ready] {client.user} (id={client.user.id})")
-    print(f"[ready] panel: {PANEL_BASE} user={PANEL_USER} days={DEFAULT_DAYS}")
-
-    # panel login probe
-    try:
-        ok = await panel_login()
-        print(f"[ready] panel login: {'ok' if ok else 'FAILED'}")
-    except Exception as e:
-        print(f"[ready] panel probe error: {e}")
+    print(f"[ready] owner: {OWNER_ID}")
+    print(f"[ready] guild: {GUILD_ID or 'GLOBAL'}")
+    print(f"[ready] watch: {WATCH_CHANNEL_ID or 'ANY'}")
+    print(f"[ready] ticket: {TICKET_CHANNEL_ID or 'unset'}")
+    print(f"[ready] target: {TARGET_URL}")
+    print(f"[ready] claims: {len(load_claims())} | limits: {len(load_limits())}")
 
     try:
         if GUILD_ID:
@@ -555,9 +491,15 @@ async def on_ready():
             tree.copy_global_to(guild=guild)
             synced = await tree.sync(guild=guild)
             print(f"[sync] guild {GUILD_ID} → {len(synced)} commands")
+            for c in synced:
+                print(f"[sync]   /{c.name}")
         else:
             synced = await tree.sync()
             print(f"[sync] global → {len(synced)} commands (up to 1h)")
+            for c in synced:
+                print(f"[sync]   /{c.name}")
+    except discord.Forbidden as e:
+        print(f"[sync] Forbidden — applications.commands scope missing? {e}")
     except Exception as e:
         print(f"[sync] failed: {type(e).__name__}: {e}")
 
