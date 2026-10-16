@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import asyncio
 import aiohttp
 import discord
@@ -18,9 +19,12 @@ TARGET_URL = os.getenv(
 )
 WATCH_CHANNEL_ID_RAW = os.getenv("WATCH_CHANNEL_ID", "").strip()
 WATCH_CHANNEL_ID = int(WATCH_CHANNEL_ID_RAW) if WATCH_CHANNEL_ID_RAW.isdigit() else 0
+TICKET_CHANNEL_ID_RAW = os.getenv("TICKET_CHANNEL_ID", "").strip()
+TICKET_CHANNEL_ID = int(TICKET_CHANNEL_ID_RAW) if TICKET_CHANNEL_ID_RAW.isdigit() else 0
 PORT = int(os.getenv("PORT", "10000"))
 REQUEST_TIMEOUT = 20
 UID_RE = re.compile(r"^\d{8,12}$")
+DB = "claims.json"
 
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN missing in environment")
@@ -32,6 +36,58 @@ intents.messages = True
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+
+_claims_lock = asyncio.Lock()
+
+
+def load_claims() -> dict:
+    if os.path.exists(DB):
+        try:
+            with open(DB, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_claims(data: dict) -> None:
+    try:
+        with open(DB, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[claims] save failed: {e}")
+
+
+def ticket_link() -> str:
+    if TICKET_CHANNEL_ID and GUILD_ID:
+        return f"https://discord.com/channels/{GUILD_ID}/{TICKET_CHANNEL_ID}"
+    return ""
+
+
+def build_limit_embed(author: discord.abc.User) -> discord.Embed:
+    e = discord.Embed(
+        title="\u26D4 User Limit Reached",
+        description=(
+            "You have already claimed **1 UID**.\n"
+            "Each user may only add **1 UID** in total.\n\n"
+            "To change or add another UID, open a ticket in "
+            "**create-ticket**."
+        ),
+        color=discord.Color.from_rgb(220, 38, 38),
+        timestamp=discord.utils.utcnow(),
+    )
+    link = ticket_link()
+    if link:
+        e.add_field(
+            name="\U0001F3AB Open Ticket",
+            value=f"[Click here]({link})",
+            inline=False,
+        )
+    e.set_footer(
+        text=f"Executed by {author.display_name}",
+        icon_url=author.display_avatar.url,
+    )
+    return e
 
 
 async def submit_uid(uid: str) -> dict:
@@ -123,6 +179,41 @@ def build_failure(uid: str, status: int, snippet: str, author: discord.abc.User)
     return embed
 
 
+async def process_request(uid: str, author: discord.abc.User, reply_target):
+    async with _claims_lock:
+        claims = load_claims()
+        key = str(author.id)
+
+        if key in claims:
+            embed = build_limit_embed(author)
+            if reply_target is not None:
+                try:
+                    await reply_target(embed)
+                except discord.Forbidden:
+                    pass
+            return
+
+        result = await submit_uid(uid)
+        data = result.get("data")
+        status = result.get("status", 0)
+
+        if status == 200 and isinstance(data, dict) and data.get("success"):
+            claims[key] = {
+                "uid": uid,
+                "claimedAt": discord.utils.utcnow().isoformat(),
+            }
+            save_claims(claims)
+            embed = build_success(uid, data, author)
+        else:
+            embed = build_failure(uid, status, result.get("text", ""), author)
+
+        if reply_target is not None:
+            try:
+                await reply_target(embed)
+            except discord.Forbidden:
+                pass
+
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -139,28 +230,14 @@ async def on_message(message: discord.Message):
         return
 
     uid = content
-    result = await submit_uid(uid)
-    data = result.get("data")
-    status = result.get("status", 0)
 
-    if status == 200 and isinstance(data, dict) and data.get("success"):
-        embed = build_success(uid, data, message.author)
+    async def reply(embed):
         try:
             await message.reply(embed=embed, mention_author=False)
         except discord.Forbidden:
             pass
-    elif status == 200 and isinstance(data, dict) and data.get("alreadyClaimed"):
-        embed = build_success(uid, data, message.author)
-        try:
-            await message.reply(embed=embed, mention_author=False)
-        except discord.Forbidden:
-            pass
-    else:
-        embed = build_failure(uid, status, result.get("text", ""), message.author)
-        try:
-            await message.reply(embed=embed, mention_author=False)
-        except discord.Forbidden:
-            pass
+
+    await process_request(uid, message.author, reply)
 
 
 @tree.command(name="add", description="Add a UID to the bypass portal")
@@ -184,25 +261,54 @@ async def add_uid(interaction: discord.Interaction, uid: str):
 
     await interaction.response.defer(ephemeral=False, thinking=True)
 
-    result = await submit_uid(uid)
-    data = result.get("data")
-    status = result.get("status", 0)
+    async def reply(embed):
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=False)
+        except discord.Forbidden:
+            pass
 
-    if status == 200 and isinstance(data, dict) and data.get("success"):
-        embed = build_success(uid, data, interaction.user)
-        await interaction.followup.send(embed=embed, ephemeral=False)
-    else:
-        embed = build_failure(uid, status, result.get("text", ""), interaction.user)
-        await interaction.followup.send(embed=embed, ephemeral=False)
+    await process_request(uid, interaction.user, reply)
+
+
+@tree.command(name="add-reset", description="Reset a user's UID claim (admin only)")
+@app_commands.describe(user="User whose claim to reset")
+@app_commands.default_permissions(manage_guild=True)
+async def add_reset(interaction: discord.Interaction, user: discord.Member):
+    async with _claims_lock:
+        claims = load_claims()
+        key = str(user.id)
+        if key not in claims:
+            await interaction.response.send_message(
+                f"{user.mention} has no claim on record.", ephemeral=True
+            )
+            return
+        old = claims.pop(key)
+        save_claims(claims)
+
+    embed = discord.Embed(
+        title="\u267B\uFE0F Claim Reset",
+        description=f"Removed claim for {user.mention}.",
+        color=discord.Color.from_rgb(220, 38, 38),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Previous UID", value=f"`{old.get('uid','?')}`", inline=True)
+    embed.set_footer(
+        text=f"Executed by {interaction.user.display_name}",
+        icon_url=interaction.user.display_avatar.url,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
 @tree.command(name="ping", description="Check if the bot is online")
 async def ping(interaction: discord.Interaction):
     latency = round(client.latency * 1000)
+    claims = load_claims()
     await interaction.response.send_message(
         f"pong — gateway `{latency}ms`\n"
         f"guild scoped: `{GUILD_ID or 'global'}`\n"
         f"watch channel: `{WATCH_CHANNEL_ID or 'any'}`\n"
+        f"ticket channel: `{TICKET_CHANNEL_ID or 'unset'}`\n"
+        f"total claims recorded: `{len(claims)}`\n"
         f"commands loaded: `{[c.name for c in tree.get_commands()]}`",
         ephemeral=True,
     )
@@ -234,7 +340,9 @@ async def on_ready():
     print(f"[ready] {client.user} (id={client.user.id})")
     print(f"[ready] guild target: {GUILD_ID or 'GLOBAL'}")
     print(f"[ready] watch channel: {WATCH_CHANNEL_ID or 'ANY'}")
+    print(f"[ready] ticket channel: {TICKET_CHANNEL_ID or 'unset'}")
     print(f"[ready] target url: {TARGET_URL}")
+    print(f"[ready] claims on disk: {len(load_claims())}")
 
     try:
         if GUILD_ID:
