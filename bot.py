@@ -14,13 +14,19 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
 GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW.isdigit() else 0
 
-# ===== RESELLER PANEL (API swap) =====
+# ===== RESELLER PANEL (creds from Render env) =====
 PANEL_BASE = os.getenv("PANEL_BASE", "http://82.41.64.36:2007").rstrip("/")
-PANEL_USER = os.getenv("PANEL_USER", "BENX")
-PANEL_PASS = os.getenv("PANEL_PASS", "1234")
+PANEL_USER = os.getenv("PANEL_USER", "")
+PANEL_PASS = os.getenv("PANEL_PASS", "")
 PANEL_ADD_ACTION = "add_uid"
 DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "2"))
-# =====================================
+# ==================================================
+
+# ===== GLOBAL UID LIMIT (from Render env) =====
+# GLOBAL_UID_LIMIT = মোট কতগুলো UID পুরো বটে add হবে (সব ইউজার মিলিয়ে)।
+# 0 = unlimited। কোনো ইউজার এই লিমিটে পৌঁছে গেলে আর add করতে পারবে না।
+GLOBAL_UID_LIMIT = int(os.getenv("GLOBAL_UID_LIMIT", "100"))
+# ==============================================
 
 WATCH_CHANNEL_ID_RAW = os.getenv("WATCH_CHANNEL_ID", "").strip()
 WATCH_CHANNEL_ID = int(WATCH_CHANNEL_ID_RAW) if WATCH_CHANNEL_ID_RAW.isdigit() else 0
@@ -37,6 +43,8 @@ LIMITS_DB = "limits.json"
 
 if not TOKEN:
     raise SystemExit("DISCORD_TOKEN missing in environment")
+if not PANEL_USER or not PANEL_PASS:
+    raise SystemExit("PANEL_USER / PANEL_PASS missing in environment")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -121,6 +129,18 @@ def add_user_claim(user_id: int, uid: str) -> None:
     save_claims(claims)
 
 
+def total_claims_count() -> int:
+    """সব ইউজার মিলিয়ে মোট claim সংখ্যা।"""
+    claims = load_claims()
+    total = 0
+    for entry in claims.values():
+        if isinstance(entry, list):
+            total += len(entry)
+        elif isinstance(entry, dict):
+            total += 1
+    return total
+
+
 def ticket_link() -> str:
     if TICKET_CHANNEL_ID and GUILD_ID:
         return f"https://discord.com/channels/{GUILD_ID}/{TICKET_CHANNEL_ID}"
@@ -151,7 +171,33 @@ def build_limit_embed(author: discord.abc.User, used: int, limit: int) -> discor
     return e
 
 
-# ===== PANEL HTTP (API swap only) =====
+def build_global_limit_embed(author: discord.abc.User,
+                             used: int, limit: int) -> discord.Embed:
+    e = discord.Embed(
+        title="\u26D4 Global UID Limit Reached",
+        description=(
+            f"All **{limit}** available UID slots have been used "
+            f"(**{used}/{limit}**).\n"
+            "No more UIDs can be added right now. Open a ticket for details."
+        ),
+        color=discord.Color.from_rgb(220, 38, 38),
+        timestamp=discord.utils.utcnow(),
+    )
+    link = ticket_link()
+    if link:
+        e.add_field(
+            name="\U0001F3AB Open Ticket",
+            value=f"[Click here]({link})",
+            inline=False,
+        )
+    e.set_footer(
+        text=f"Executed by {author.display_name}",
+        icon_url=author.display_avatar.url,
+    )
+    return e
+
+
+# ===== PANEL HTTP =====
 
 async def _get_panel_session() -> aiohttp.ClientSession:
     global _panel_session
@@ -163,7 +209,6 @@ async def _get_panel_session() -> aiohttp.ClientSession:
 
 
 async def submit_uid(uid: str) -> dict:
-    """Same return shape as before. Internals now go to the reseller panel."""
     session = await _get_panel_session()
 
     headers = {
@@ -175,7 +220,6 @@ async def submit_uid(uid: str) -> dict:
     }
 
     try:
-        # 1) login — cookie session নেয়
         async with session.post(
             f"{PANEL_BASE}/login",
             data={"username": PANEL_USER, "password": PANEL_PASS},
@@ -184,7 +228,6 @@ async def submit_uid(uid: str) -> dict:
         ) as lr:
             print(f"[panel] login {lr.status}")
 
-        # 2) UID add — DEFAULT_DAYS দিনের জন্য
         async with session.post(
             f"{PANEL_BASE}/reseller",
             data={
@@ -292,6 +335,18 @@ def build_failure(uid: str, status: int, snippet: str,
 
 async def process_request(uid: str, author: discord.abc.User, reply_target):
     async with _claims_lock:
+        # 1) global limit check (সব ইউজার মিলিয়ে)
+        total_used = total_claims_count()
+        if GLOBAL_UID_LIMIT > 0 and total_used >= GLOBAL_UID_LIMIT:
+            embed = build_global_limit_embed(author, total_used, GLOBAL_UID_LIMIT)
+            if reply_target is not None:
+                try:
+                    await reply_target(embed)
+                except discord.Forbidden:
+                    pass
+            return
+
+        # 2) per-user limit check
         limit = get_user_limit(author.id)
         used_list = get_user_claims(author.id)
         used = len(used_list)
@@ -305,6 +360,7 @@ async def process_request(uid: str, author: discord.abc.User, reply_target):
                     pass
             return
 
+        # 3) submit
         result = await submit_uid(uid)
         data = result.get("data")
         status = result.get("status", 0)
@@ -492,11 +548,14 @@ async def claims_cmd(interaction: discord.Interaction, user: discord.Member = No
 @tree.command(name="ping", description="Check if the bot is online")
 async def ping(interaction: discord.Interaction):
     latency = round(client.latency * 1000)
+    total = total_claims_count()
+    global_str = "unlimited" if GLOBAL_UID_LIMIT <= 0 else f"{total}/{GLOBAL_UID_LIMIT}"
     await interaction.response.send_message(
         f"pong — gateway `{latency}ms`\n"
         f"guild: `{GUILD_ID or 'global'}`\n"
         f"watch: `{WATCH_CHANNEL_ID or 'any'}`\n"
         f"ticket: `{TICKET_CHANNEL_ID or 'unset'}`\n"
+        f"global: `{global_str}`\n"
         f"claims: `{len(load_claims())}` | limits: `{len(load_limits())}`\n"
         f"commands: `{[c.name for c in tree.get_commands()]}`",
         ephemeral=True,
@@ -532,6 +591,7 @@ async def on_ready():
     print(f"[ready] watch: {WATCH_CHANNEL_ID or 'ANY'}")
     print(f"[ready] ticket: {TICKET_CHANNEL_ID or 'unset'}")
     print(f"[ready] panel: {PANEL_BASE} user={PANEL_USER} days={DEFAULT_DAYS}")
+    print(f"[ready] global limit: {GLOBAL_UID_LIMIT or 'unlimited'}")
     print(f"[ready] claims: {len(load_claims())} | limits: {len(load_limits())}")
 
     try:
