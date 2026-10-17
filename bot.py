@@ -18,7 +18,7 @@ PANEL_BASE = os.getenv("PANEL_BASE", "http://82.41.64.36:2007").rstrip("/")
 PANEL_USER = os.getenv("PANEL_USER", "")
 PANEL_PASS = os.getenv("PANEL_PASS", "")
 PANEL_ADD_ACTION = "add_uid"
-DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "2"))
+DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "30"))
 
 GLOBAL_UID_LIMIT = int(os.getenv("GLOBAL_UID_LIMIT", "100"))
 
@@ -64,8 +64,8 @@ def _load_json(path: str, default: dict) -> dict:
 
 def _save_json(path: str, data: dict) -> None:
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
     except Exception as e:
         print(f"[db] save failed ({path}): {e}")
 
@@ -132,6 +132,17 @@ def total_claims_count() -> int:
         elif isinstance(entry, dict):
             total += 1
     return total
+
+
+def get_all_bot_uids() -> list:
+    claims = load_claims()
+    uids = []
+    for entry in claims.values():
+        if isinstance(entry, list):
+            uids.extend([r["uid"] for r in entry if "uid" in r])
+        elif isinstance(entry, dict) and "uid" in entry:
+            uids.append(entry["uid"])
+    return uids
 
 
 def ticket_link() -> str:
@@ -282,6 +293,80 @@ async def submit_uid(uid: str) -> dict:
         return {"status": 0, "text": f"{type(e).__name__}: {e}", "data": None}
 
 
+async def delete_panel_uid(uid: str) -> dict:
+    session = await _get_panel_session()
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
+        "Referer": f"{PANEL_BASE}/reseller",
+        "Origin": PANEL_BASE,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    try:
+        async with session.get(f"{PANEL_BASE}/reseller", headers=headers) as gr:
+            page = await gr.text()
+            
+        csrf = ""
+        m = re.search(r'name=["\']csrf_token["\']\s+value=["\']([^"\']+)', page)
+        if m:
+            csrf = m.group(1)
+
+        login_data = {"username": PANEL_USER, "password": PANEL_PASS}
+        if csrf:
+            login_data["csrf_token"] = csrf
+
+        async with session.post(
+            f"{PANEL_BASE}/login",
+            data=login_data,
+            headers=headers,
+            allow_redirects=True,
+        ) as lr:
+            if lr.url.path.endswith("/login"):
+                return {"success": False, "error": "Login failed"}
+
+        async with session.get(f"{PANEL_BASE}/reseller", headers=headers) as gr:
+            page = await gr.text()
+
+        user_id = None
+        match = re.search(rf'{uid}.*?name="user_id"\s+value="(\d+)"', page, re.DOTALL)
+        if match:
+            user_id = match.group(1)
+        
+        if not user_id:
+            return {"success": False, "error": "UID not found on panel"}
+
+        del_data = {
+            "action": "delete_user",
+            "user_id": user_id,
+        }
+        if csrf:
+            del_data["csrf_token"] = csrf
+
+        async with session.post(
+            f"{PANEL_BASE}/reseller",
+            data=del_data,
+            headers=headers,
+            allow_redirects=True,
+        ) as dr:
+            text = await dr.text()
+            print(f"[panel] delete {dr.status}")
+
+        await asyncio.sleep(1)
+        async with session.get(f"{PANEL_BASE}/reseller", headers=headers) as vr:
+            verify = await vr.text()
+            if uid not in verify:
+                return {"success": True}
+            else:
+                return {"success": False, "error": "UID still present after delete"}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def build_success(uid: str, data: dict, author: discord.abc.User,
                   used: int, limit: int) -> discord.Embed:
     claim = data.get("claim") or {}
@@ -414,9 +499,13 @@ async def on_message(message: discord.Message):
     await process_request(content, message.author, reply)
 
 
-@tree.command(name="add", description="Add a UID to the bypass portal")
+@tree.command(name="add", description="Add a UID to the bypass portal (owner only)")
 @app_commands.describe(uid="Numeric game UID (8-12 digits)")
 async def add_uid(interaction: discord.Interaction, uid: str):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+
     uid = uid.strip()
     if not UID_RE.match(uid):
         bad = discord.Embed(
@@ -441,6 +530,98 @@ async def add_uid(interaction: discord.Interaction, uid: str):
             pass
 
     await process_request(uid, interaction.user, reply)
+
+
+@tree.command(name="remove", description="Remove UID(s) from the panel (owner only)")
+@app_commands.describe(
+    uid="Specific UID to remove (leave empty if using all)",
+    all="Remove ALL UIDs that were added via this bot"
+)
+async def remove_cmd(interaction: discord.Interaction, uid: str = None, all: bool = False):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+
+    if not uid and not all:
+        await interaction.response.send_message("Provide `uid` or set `all` to True.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=False)
+    removed_count = 0
+    failed_count = 0
+
+    if all:
+        bot_uids = get_all_bot_uids()
+        if not bot_uids:
+            await interaction.followup.send("No UIDs added by this bot.")
+            return
+            
+        for target_uid in bot_uids:
+            res = await delete_panel_uid(target_uid)
+            if res.get("success"):
+                removed_count += 1
+                async with _claims_lock:
+                    claims = load_claims()
+                    for k, v in claims.items():
+                        if isinstance(v, list):
+                            claims[k] = [r for r in v if r.get("uid") != target_uid]
+                        elif isinstance(v, dict) and v.get("uid") == target_uid:
+                            claims.pop(k, None)
+                    save_claims(claims)
+            else:
+                failed_count += 1
+
+        embed = discord.Embed(
+            title="\u267B\uFE0F Bot UIDs Removed",
+            description=f"Removed **{removed_count}** UIDs added by the bot.\nFailed: **{failed_count}**",
+            color=discord.Color.from_rgb(220, 38, 38),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_footer(
+            text=f"Executed by {interaction.user.display_name}",
+            icon_url=interaction.user.display_avatar.url,
+        )
+        await interaction.followup.send(embed=embed)
+    else:
+        target_uid = uid.strip()
+        if not UID_RE.match(target_uid):
+            await interaction.followup.send("Invalid UID format (8-12 digits).")
+            return
+
+        res = await delete_panel_uid(target_uid)
+        if res.get("success"):
+            async with _claims_lock:
+                claims = load_claims()
+                for k, v in claims.items():
+                    if isinstance(v, list):
+                        claims[k] = [r for r in v if r.get("uid") != target_uid]
+                    elif isinstance(v, dict) and v.get("uid") == target_uid:
+                        claims.pop(k, None)
+                save_claims(claims)
+
+            embed = discord.Embed(
+                title="\u2705 UID Removed",
+                description=f"`{target_uid}` removed from panel.",
+                color=discord.Color.from_rgb(220, 38, 38),
+                timestamp=discord.utils.utcnow(),
+            )
+            embed.set_footer(
+                text=f"Executed by {interaction.user.display_name}",
+                icon_url=interaction.user.display_avatar.url,
+            )
+            await interaction.followup.send(embed=embed)
+        else:
+            embed = discord.Embed(
+                title="\u274c UID Remove Failed",
+                description=f"`{target_uid}` could not be removed.\nError: `{res.get('error')}`",
+                color=discord.Color.from_rgb(190, 18, 60),
+                timestamp=discord.utils.utcnow(),
+            )
+            embed.set_footer(
+                text=f"Executed by {interaction.user.display_name}",
+                icon_url=interaction.user.display_avatar.url,
+            )
+            await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="whitelist", description="Set UID limit for a user (owner only)")
@@ -485,12 +666,11 @@ async def whitelist_cmd(interaction: discord.Interaction,
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
-@tree.command(name="add-reset", description="Reset a user's UID claims (owner or admin)")
+@tree.command(name="add-reset", description="Reset a user's UID claims (owner only)")
 @app_commands.describe(user="User whose claims to reset")
-@app_commands.default_permissions(manage_guild=True)
 async def add_reset(interaction: discord.Interaction, user: discord.Member):
-    if interaction.user.id != OWNER_ID and not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("Not allowed.", ephemeral=True)
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
         return
 
     async with _claims_lock:
@@ -517,17 +697,14 @@ async def add_reset(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
-@tree.command(name="claims", description="Show a user's current claims")
+@tree.command(name="claims", description="Show a user's current claims (owner only)")
 @app_commands.describe(user="Target user (optional, default: yourself)")
 async def claims_cmd(interaction: discord.Interaction, user: discord.Member = None):
-    target = user or interaction.user
-    if target.id != interaction.user.id and interaction.user.id != OWNER_ID \
-            and not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message(
-            "You can only view your own claims.", ephemeral=True
-        )
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
         return
 
+    target = user or interaction.user
     claims = get_user_claims(target.id)
     limit = get_user_limit(target.id)
     limit_str = "`unlimited`" if limit >= 10**8 else f"`{limit}`"
@@ -556,8 +733,12 @@ async def claims_cmd(interaction: discord.Interaction, user: discord.Member = No
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@tree.command(name="ping", description="Check if the bot is online")
+@tree.command(name="ping", description="Check if the bot is online (owner only)")
 async def ping(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Owner only.", ephemeral=True)
+        return
+
     latency = round(client.latency * 1000)
     total = total_claims_count()
     global_str = "unlimited" if GLOBAL_UID_LIMIT <= 0 else f"{total}/{GLOBAL_UID_LIMIT}"
