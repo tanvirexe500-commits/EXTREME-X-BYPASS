@@ -14,19 +14,13 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
 GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW.isdigit() else 0
 
-# ===== RESELLER PANEL (creds from Render env) =====
 PANEL_BASE = os.getenv("PANEL_BASE", "http://82.41.64.36:2007").rstrip("/")
 PANEL_USER = os.getenv("PANEL_USER", "")
 PANEL_PASS = os.getenv("PANEL_PASS", "")
 PANEL_ADD_ACTION = "add_uid"
 DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "2"))
-# ==================================================
 
-# ===== GLOBAL UID LIMIT (from Render env) =====
-# GLOBAL_UID_LIMIT = মোট কতগুলো UID পুরো বটে add হবে (সব ইউজার মিলিয়ে)।
-# 0 = unlimited। কোনো ইউজার এই লিমিটে পৌঁছে গেলে আর add করতে পারবে না।
 GLOBAL_UID_LIMIT = int(os.getenv("GLOBAL_UID_LIMIT", "100"))
-# ==============================================
 
 WATCH_CHANNEL_ID_RAW = os.getenv("WATCH_CHANNEL_ID", "").strip()
 WATCH_CHANNEL_ID = int(WATCH_CHANNEL_ID_RAW) if WATCH_CHANNEL_ID_RAW.isdigit() else 0
@@ -130,7 +124,6 @@ def add_user_claim(user_id: int, uid: str) -> None:
 
 
 def total_claims_count() -> int:
-    """সব ইউজার মিলিয়ে মোট claim সংখ্যা।"""
     claims = load_claims()
     total = 0
     for entry in claims.values():
@@ -197,8 +190,6 @@ def build_global_limit_embed(author: discord.abc.User,
     return e
 
 
-# ===== PANEL HTTP =====
-
 async def _get_panel_session() -> aiohttp.ClientSession:
     global _panel_session
     if _panel_session is None or _panel_session.closed:
@@ -217,32 +208,58 @@ async def submit_uid(uid: str) -> dict:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
         ),
         "Referer": f"{PANEL_BASE}/reseller",
+        "Origin": PANEL_BASE,
+        "Content-Type": "application/x-www-form-urlencoded",
     }
 
     try:
+        async with session.get(f"{PANEL_BASE}/reseller", headers=headers) as gr:
+            page = await gr.text()
+            
+        csrf = ""
+        m = re.search(r'name=["\']csrf_token["\']\s+value=["\']([^"\']+)', page)
+        if m:
+            csrf = m.group(1)
+
+        login_data = {"username": PANEL_USER, "password": PANEL_PASS}
+        if csrf:
+            login_data["csrf_token"] = csrf
+
         async with session.post(
             f"{PANEL_BASE}/login",
-            data={"username": PANEL_USER, "password": PANEL_PASS},
+            data=login_data,
             headers=headers,
             allow_redirects=True,
         ) as lr:
             print(f"[panel] login {lr.status}")
+            if lr.url.path.endswith("/login"):
+                return {"status": lr.status, "text": "login failed", "data": None}
+
+        add_data = {
+            "action": PANEL_ADD_ACTION,
+            "uid": uid,
+            "custom_name": "",
+            "days": str(DEFAULT_DAYS),
+        }
+        if csrf:
+            add_data["csrf_token"] = csrf
 
         async with session.post(
             f"{PANEL_BASE}/reseller",
-            data={
-                "action": PANEL_ADD_ACTION,
-                "uid": uid,
-                "days": str(DEFAULT_DAYS),
-                "custom_name": "",
-            },
+            data=add_data,
             headers=headers,
             allow_redirects=True,
         ) as r:
             text = await r.text()
-            ok = r.status < 400
+            
+            if r.url.path.endswith("/login"):
+                return {"status": r.status, "text": text, "data": None}
 
-            if ok:
+        await asyncio.sleep(1)
+        async with session.get(f"{PANEL_BASE}/reseller", headers=headers) as vr:
+            verify = await vr.text()
+            
+            if uid in verify:
                 data = {
                     "success": True,
                     "claim": {
@@ -255,17 +272,14 @@ async def submit_uid(uid: str) -> dict:
                     "message": f"Account ID '{uid}' added successfully.",
                     "alreadyClaimed": False,
                 }
+                return {"status": 200, "text": verify, "data": data}
             else:
-                data = None
-
-            return {"status": r.status, "text": text, "data": data}
+                return {"status": r.status, "text": "UID not found in dashboard", "data": None}
 
     except asyncio.TimeoutError:
         return {"status": 0, "text": "timeout", "data": None}
     except Exception as e:
         return {"status": 0, "text": f"{type(e).__name__}: {e}", "data": None}
-
-# ===== END PANEL HTTP =====
 
 
 def build_success(uid: str, data: dict, author: discord.abc.User,
@@ -335,7 +349,6 @@ def build_failure(uid: str, status: int, snippet: str,
 
 async def process_request(uid: str, author: discord.abc.User, reply_target):
     async with _claims_lock:
-        # 1) global limit check (সব ইউজার মিলিয়ে)
         total_used = total_claims_count()
         if GLOBAL_UID_LIMIT > 0 and total_used >= GLOBAL_UID_LIMIT:
             embed = build_global_limit_embed(author, total_used, GLOBAL_UID_LIMIT)
@@ -346,7 +359,6 @@ async def process_request(uid: str, author: discord.abc.User, reply_target):
                     pass
             return
 
-        # 2) per-user limit check
         limit = get_user_limit(author.id)
         used_list = get_user_claims(author.id)
         used = len(used_list)
@@ -360,7 +372,6 @@ async def process_request(uid: str, author: discord.abc.User, reply_target):
                     pass
             return
 
-        # 3) submit
         result = await submit_uid(uid)
         data = result.get("data")
         status = result.get("status", 0)
