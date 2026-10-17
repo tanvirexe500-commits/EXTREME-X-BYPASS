@@ -15,8 +15,8 @@ GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
 GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW.isdigit() else 0
 
 PANEL_BASE = os.getenv("PANEL_BASE", "http://82.41.64.36:2007").rstrip("/")
-PANEL_USER = os.getenv("PANEL_USER", "")
-PANEL_PASS = os.getenv("PANEL_PASS", "")
+PANEL_USER = os.getenv("PANEL_USER", "").strip()
+PANEL_PASS = os.getenv("PANEL_PASS", "").strip()
 PANEL_ADD_ACTION = "add_uid"
 DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "30"))
 
@@ -64,8 +64,8 @@ def _load_json(path: str, default: dict) -> dict:
 
 def _save_json(path: str, data: dict) -> None:
     try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
     except Exception as e:
         print(f"[db] save failed ({path}): {e}")
 
@@ -213,6 +213,9 @@ async def _get_panel_session() -> aiohttp.ClientSession:
 async def submit_uid(uid: str) -> dict:
     session = await _get_panel_session()
 
+    print(f"[debug] PANEL_USER = '{PANEL_USER}' (len={len(PANEL_USER)})")
+    print(f"[debug] PANEL_PASS = '{PANEL_PASS}' (len={len(PANEL_PASS)})")
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -226,11 +229,15 @@ async def submit_uid(uid: str) -> dict:
     try:
         async with session.get(f"{PANEL_BASE}/reseller", headers=headers) as gr:
             page = await gr.text()
+            print(f"[panel] GET /reseller status={gr.status} len={len(page)}")
             
         csrf = ""
         m = re.search(r'name=["\']csrf_token["\']\s+value=["\']([^"\']+)', page)
         if m:
             csrf = m.group(1)
+            print(f"[panel] csrf found: {csrf[:15]}...")
+        else:
+            print("[panel] no csrf token in page")
 
         login_data = {"username": PANEL_USER, "password": PANEL_PASS}
         if csrf:
@@ -242,8 +249,9 @@ async def submit_uid(uid: str) -> dict:
             headers=headers,
             allow_redirects=True,
         ) as lr:
-            print(f"[panel] login {lr.status}")
+            print(f"[panel] login status={lr.status} final_url={lr.url}")
             if lr.url.path.endswith("/login"):
+                print("[panel] LOGIN FAILED - check creds in Render")
                 return {"status": lr.status, "text": "login failed", "data": None}
 
         add_data = {
@@ -262,15 +270,18 @@ async def submit_uid(uid: str) -> dict:
             allow_redirects=True,
         ) as r:
             text = await r.text()
+            print(f"[panel] add status={r.status} len={len(text)}")
             
             if r.url.path.endswith("/login"):
-                return {"status": r.status, "text": text, "data": None}
+                print("[panel] SESSION LOST during add")
+                return {"status": r.status, "text": "session lost", "data": None}
 
         await asyncio.sleep(1)
         async with session.get(f"{PANEL_BASE}/reseller", headers=headers) as vr:
             verify = await vr.text()
             
             if uid in verify:
+                print(f"[panel] VERIFIED — UID {uid} is in dashboard")
                 data = {
                     "success": True,
                     "claim": {
@@ -285,6 +296,7 @@ async def submit_uid(uid: str) -> dict:
                 }
                 return {"status": 200, "text": verify, "data": data}
             else:
+                print(f"[panel] NOT VERIFIED — UID {uid} not in dashboard")
                 return {"status": r.status, "text": "UID not found in dashboard", "data": None}
 
     except asyncio.TimeoutError:
