@@ -1,8 +1,10 @@
 import os
 import re
 import json
+import urllib.request
+import urllib.parse
+import http.cookiejar
 import asyncio
-import aiohttp
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -49,7 +51,6 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 _claims_lock = asyncio.Lock()
-_panel_session: aiohttp.ClientSession | None = None
 
 
 def _load_json(path: str, default: dict) -> dict:
@@ -190,67 +191,39 @@ def build_global_limit_embed(author: discord.abc.User,
     return e
 
 
-async def _get_panel_session() -> aiohttp.ClientSession:
-    global _panel_session
-    if _panel_session is None or _panel_session.closed:
-        _panel_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            cookie_jar=aiohttp.CookieJar(unsafe=True),
-        )
-    return _panel_session
-
-
-async def submit_uid(uid: str) -> dict:
-    session = await _get_panel_session()
-
+def _sync_submit_uid(uid: str) -> dict:
+    base = PANEL_BASE
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        ),
-        "Referer": f"{PANEL_BASE}/reseller",
-        "Origin": PANEL_BASE,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
+        "Referer": f"{base}/reseller",
+        "Origin": base,
         "Content-Type": "application/x-www-form-urlencoded",
     }
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
 
     try:
-        login_data = {"username": PANEL_USER, "password": PANEL_PASS}
-        async with session.post(
-            f"{PANEL_BASE}/login",
-            data=login_data,
-            headers=headers,
-            allow_redirects=True,
-        ) as lr:
-            login_body = await lr.text()
-            if "ADMIN LOGIN" in login_body or "CLIENT LOGIN" in login_body:
-                print("[panel] login failed")
-                return {"status": lr.status, "text": "login failed", "data": None}
+        body = urllib.parse.urlencode({"username": PANEL_USER, "password": PANEL_PASS}).encode()
+        req = urllib.request.Request(f"{base}/login", data=body, headers=headers, method="POST")
+        with opener.open(req, timeout=REQUEST_TIMEOUT) as r:
+            login_res = r.read().decode("utf-8", "replace")
+            if "ADMIN LOGIN" in login_res or "CLIENT LOGIN" in login_res:
+                return {"status": 200, "text": "login failed", "data": None}
 
-        add_data = {
+        payload = {
             "action": PANEL_ADD_ACTION,
             "uid": uid,
             "custom_name": "discord-bot",
             "days": str(DEFAULT_DAYS),
         }
+        body = urllib.parse.urlencode(payload).encode()
+        req = urllib.request.Request(f"{base}/reseller", data=body, headers=headers, method="POST")
+        with opener.open(req, timeout=REQUEST_TIMEOUT) as r:
+            pass
 
-        async with session.post(
-            f"{PANEL_BASE}/reseller",
-            data=add_data,
-            headers=headers,
-            allow_redirects=False,
-        ) as r:
-            status = r.status
-            if status in (301, 302, 303, 307, 308):
-                redirect_url = r.headers.get("Location", "/reseller")
-                if not redirect_url.startswith("http"):
-                    redirect_url = PANEL_BASE + redirect_url
-                async with session.get(redirect_url, headers=headers) as gr:
-                    text = await gr.text()
-            else:
-                text = await r.text()
-
-        if "ADMIN LOGIN" in text or "CLIENT LOGIN" in text:
-            return {"status": 200, "text": "Session dropped during POST.", "data": None}
+        req = urllib.request.Request(f"{base}/reseller", headers=headers)
+        with opener.open(req, timeout=REQUEST_TIMEOUT) as r:
+            text = r.read().decode("utf-8", "replace")
 
         if uid in text:
             data = {
@@ -274,12 +247,16 @@ async def submit_uid(uid: str) -> dict:
         if "No UIDs registered yet" in text:
             return {"status": 200, "text": err or "Panel rejected UID (empty state returned).", "data": None}
 
-        return {"status": 200, "text": err or "UID not found, and no error message was provided.", "data": None}
+        return {"status": 200, "text": err or "UID not found in dashboard after POST.", "data": None}
 
-    except asyncio.TimeoutError:
-        return {"status": 0, "text": "timeout", "data": None}
+    except urllib.error.URLError as e:
+        return {"status": 0, "text": f"Network error: {e.reason}", "data": None}
     except Exception as e:
         return {"status": 0, "text": f"{type(e).__name__}: {e}", "data": None}
+
+
+async def submit_uid(uid: str) -> dict:
+    return await asyncio.to_thread(_sync_submit_uid, uid)
 
 
 def build_success(uid: str, data: dict, author: discord.abc.User,
