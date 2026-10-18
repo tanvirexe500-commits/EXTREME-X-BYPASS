@@ -237,26 +237,26 @@ async def submit_uid(uid: str) -> dict:
             f"{PANEL_BASE}/reseller",
             data=add_data,
             headers=headers,
-            allow_redirects=True,
+            allow_redirects=False,
         ) as r:
-            pass
+            status = r.status
+            if status in (301, 302, 303, 307, 308):
+                redirect_url = r.headers.get("Location", "/reseller")
+                if not redirect_url.startswith("http"):
+                    redirect_url = PANEL_BASE + redirect_url
+                async with session.get(redirect_url, headers=headers) as gr:
+                    text = await gr.text()
+            else:
+                text = await r.text()
 
-        async with session.get(
-            f"{PANEL_BASE}/reseller",
-            headers=headers,
-        ) as gr:
-            text = await gr.text()
+        if "ADMIN LOGIN" in text or "CLIENT LOGIN" in text:
+            return {"status": 200, "text": "Session dropped during POST.", "data": None}
 
         if uid in text:
             data = {
                 "success": True,
-                "claim": {
-                    "days": DEFAULT_DAYS,
-                    "expiresAt": "",
-                },
-                "apiResult": {
-                    "message": f"Account ID '{uid}' added successfully."
-                },
+                "claim": {"days": DEFAULT_DAYS, "expiresAt": ""},
+                "apiResult": {"message": f"Account ID '{uid}' added successfully."},
                 "message": f"Account ID '{uid}' added successfully.",
                 "alreadyClaimed": False,
             }
@@ -271,7 +271,10 @@ async def submit_uid(uid: str) -> dict:
             if m:
                 err = m.group(1).strip()
 
-        return {"status": 200, "text": err or "UID not found in dashboard after POST", "data": None}
+        if "No UIDs registered yet" in text:
+            return {"status": 200, "text": err or "Panel rejected UID (empty state returned).", "data": None}
+
+        return {"status": 200, "text": err or "UID not found, and no error message was provided.", "data": None}
 
     except asyncio.TimeoutError:
         return {"status": 0, "text": "timeout", "data": None}
