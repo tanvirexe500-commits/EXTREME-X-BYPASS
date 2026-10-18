@@ -18,7 +18,7 @@ PANEL_BASE = os.getenv("PANEL_BASE", "http://82.41.64.36:2007").rstrip("/")
 PANEL_USER = os.getenv("PANEL_USER", "")
 PANEL_PASS = os.getenv("PANEL_PASS", "")
 PANEL_ADD_ACTION = "add_uid"
-DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "2"))
+DEFAULT_DAYS = int(os.getenv("DEFAULT_DAYS", "30"))
 
 GLOBAL_UID_LIMIT = int(os.getenv("GLOBAL_UID_LIMIT", "100"))
 
@@ -214,18 +214,7 @@ async def submit_uid(uid: str) -> dict:
     }
 
     try:
-        async with session.get(f"{PANEL_BASE}/reseller", headers=headers) as gr:
-            page = await gr.text()
-
-        csrf = ""
-        m = re.search(r'name=["\']csrf_token["\']\s+value=["\']([^"\']+)', page)
-        if m:
-            csrf = m.group(1)
-
         login_data = {"username": PANEL_USER, "password": PANEL_PASS}
-        if csrf:
-            login_data["csrf_token"] = csrf
-
         async with session.post(
             f"{PANEL_BASE}/login",
             data=login_data,
@@ -233,19 +222,16 @@ async def submit_uid(uid: str) -> dict:
             allow_redirects=True,
         ) as lr:
             login_body = await lr.text()
-            print(f"[panel] login status={lr.status} url={lr.url}")
-            if lr.url.path.endswith("/login"):
-                print(f"[panel] login failed body[:300]={login_body[:300]!r}")
+            if "ADMIN LOGIN" in login_body or "CLIENT LOGIN" in login_body:
+                print("[panel] login failed")
                 return {"status": lr.status, "text": "login failed", "data": None}
 
         add_data = {
             "action": PANEL_ADD_ACTION,
             "uid": uid,
-            "custom_name": "",
+            "custom_name": "discord-bot",
             "days": str(DEFAULT_DAYS),
         }
-        if csrf:
-            add_data["csrf_token"] = csrf
 
         async with session.post(
             f"{PANEL_BASE}/reseller",
@@ -253,20 +239,15 @@ async def submit_uid(uid: str) -> dict:
             headers=headers,
             allow_redirects=True,
         ) as r:
-            text = await r.text()
-            print(f"[panel] add_uid status={r.status} url={r.url} body[:500]={text[:500]!r}")
+            pass
 
-            if r.url.path.endswith("/login"):
-                return {"status": r.status, "text": text, "data": None}
+        async with session.get(
+            f"{PANEL_BASE}/reseller",
+            headers=headers,
+        ) as gr:
+            text = await gr.text()
 
-        success = uid in text and "No UIDs registered yet" not in text
-
-        flash = ""
-        fm = re.search(r'class="toast[^"]*"[^>]*>.*?<span[^>]*>([^<]+)</span>', text, re.S)
-        if fm:
-            flash = fm.group(1).strip()
-
-        if success:
+        if uid in text:
             data = {
                 "success": True,
                 "claim": {
@@ -274,20 +255,23 @@ async def submit_uid(uid: str) -> dict:
                     "expiresAt": "",
                 },
                 "apiResult": {
-                    "message": flash or f"Account ID '{uid}' added successfully."
+                    "message": f"Account ID '{uid}' added successfully."
                 },
-                "message": flash or f"Account ID '{uid}' added successfully.",
+                "message": f"Account ID '{uid}' added successfully.",
                 "alreadyClaimed": False,
             }
             return {"status": 200, "text": text, "data": data}
 
         err = ""
-        em = re.search(r'card-alert[^>]*>\s*([^<]+)', text)
-        if em:
-            err = em.group(1).strip()
-        if not err:
-            err = flash or "UID not found in registered list after POST"
-        return {"status": r.status, "text": err, "data": None}
+        m = re.search(r'class="toast[^"]*"[^>]*>.*?<span[^>]*>([^<]+)', text, re.DOTALL)
+        if m:
+            err = m.group(1).strip()
+        else:
+            m = re.search(r'class="card-alert[^>]*>\s*([^<]+)', text)
+            if m:
+                err = m.group(1).strip()
+
+        return {"status": 200, "text": err or "UID not found in dashboard after POST", "data": None}
 
     except asyncio.TimeoutError:
         return {"status": 0, "text": "timeout", "data": None}
