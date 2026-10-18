@@ -195,6 +195,7 @@ async def _get_panel_session() -> aiohttp.ClientSession:
     if _panel_session is None or _panel_session.closed:
         _panel_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            cookie_jar=aiohttp.CookieJar(unsafe=True),
         )
     return _panel_session
 
@@ -215,7 +216,7 @@ async def submit_uid(uid: str) -> dict:
     try:
         async with session.get(f"{PANEL_BASE}/reseller", headers=headers) as gr:
             page = await gr.text()
-            
+
         csrf = ""
         m = re.search(r'name=["\']csrf_token["\']\s+value=["\']([^"\']+)', page)
         if m:
@@ -231,8 +232,10 @@ async def submit_uid(uid: str) -> dict:
             headers=headers,
             allow_redirects=True,
         ) as lr:
-            print(f"[panel] login {lr.status}")
+            login_body = await lr.text()
+            print(f"[panel] login status={lr.status} url={lr.url}")
             if lr.url.path.endswith("/login"):
+                print(f"[panel] login failed body[:300]={login_body[:300]!r}")
                 return {"status": lr.status, "text": "login failed", "data": None}
 
         add_data = {
@@ -251,30 +254,40 @@ async def submit_uid(uid: str) -> dict:
             allow_redirects=True,
         ) as r:
             text = await r.text()
-            
+            print(f"[panel] add_uid status={r.status} url={r.url} body[:500]={text[:500]!r}")
+
             if r.url.path.endswith("/login"):
                 return {"status": r.status, "text": text, "data": None}
 
-        await asyncio.sleep(1)
-        async with session.get(f"{PANEL_BASE}/reseller", headers=headers) as vr:
-            verify = await vr.text()
-            
-            if uid in verify:
-                data = {
-                    "success": True,
-                    "claim": {
-                        "days": DEFAULT_DAYS,
-                        "expiresAt": "",
-                    },
-                    "apiResult": {
-                        "message": f"Account ID '{uid}' added successfully."
-                    },
-                    "message": f"Account ID '{uid}' added successfully.",
-                    "alreadyClaimed": False,
-                }
-                return {"status": 200, "text": verify, "data": data}
-            else:
-                return {"status": r.status, "text": "UID not found in dashboard", "data": None}
+        success = uid in text and "No UIDs registered yet" not in text
+
+        flash = ""
+        fm = re.search(r'class="toast[^"]*"[^>]*>.*?<span[^>]*>([^<]+)</span>', text, re.S)
+        if fm:
+            flash = fm.group(1).strip()
+
+        if success:
+            data = {
+                "success": True,
+                "claim": {
+                    "days": DEFAULT_DAYS,
+                    "expiresAt": "",
+                },
+                "apiResult": {
+                    "message": flash or f"Account ID '{uid}' added successfully."
+                },
+                "message": flash or f"Account ID '{uid}' added successfully.",
+                "alreadyClaimed": False,
+            }
+            return {"status": 200, "text": text, "data": data}
+
+        err = ""
+        em = re.search(r'card-alert[^>]*>\s*([^<]+)', text)
+        if em:
+            err = em.group(1).strip()
+        if not err:
+            err = flash or "UID not found in registered list after POST"
+        return {"status": r.status, "text": err, "data": None}
 
     except asyncio.TimeoutError:
         return {"status": 0, "text": "timeout", "data": None}
